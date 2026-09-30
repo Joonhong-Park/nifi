@@ -9,7 +9,6 @@ if (flowFile == null) {
 def parser = new JsonSlurper()
 def skipName = 'file_insert_time'
 
-// schema에 원본 컬럼명을 alias로 부여
 def addAlias(schema, origNames, skipName) {
     def fields = schema.fields
 
@@ -21,26 +20,31 @@ def addAlias(schema, origNames, skipName) {
     def count = Math.min(fields.size() - start, origNames.size())
 
     for (int i = 0; i < count; i++) {
-        fields[start + i].aliases = [origNames[i]]
+        def field = fields[start + i]
+        def origName = origNames[i]
+
+        if (field.name == origName) {
+            // 이름이 같으면 alias 자체를 넣지 않음 (있었다면 제거)
+            field.remove('aliases')
+        } else {
+            field.aliases = [origName]
+        }
     }
 
     return schema
 }
 
 try {
-    // 원본 컬럼명 추출
     def origSchema = parser.parseText(flowFile.getAttribute('avro.schema'))
     def origNames = []
     origSchema.fields.each { f -> origNames.add(f.name) }
 
-    // in_schema, out_schema에 alias 부여
     def inSchema = parser.parseText(flowFile.getAttribute('in_schema'))
     def outSchema = parser.parseText(flowFile.getAttribute('out_schema'))
 
     addAlias(inSchema, origNames, skipName)
     addAlias(outSchema, origNames, skipName)
 
-    // 결과 저장
     flowFile = session.putAttribute(flowFile, 'in_schema', JsonOutput.toJson(inSchema))
     flowFile = session.putAttribute(flowFile, 'out_schema', JsonOutput.toJson(outSchema))
 
