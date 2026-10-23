@@ -20,7 +20,8 @@ import java.util.Map;
 /**
  * 사용자 스키마의 필드 순서대로 Parquet 컬럼을 매핑하는 ReadSupport.
  * - 이름: 사용자 스키마 i번째 필드명 (파일 컬럼명은 alias로 부여)
- * - 타입: 파일 컬럼 타입 (parquet-avro 1.17.1 변환 결과, decimal 처리 유지)
+ * - 타입: 기존 ParquetReader와 동일한 방식
+ *     1순위 파일 내장 Avro 스키마의 필드 타입, 2순위 parquet-avro 1.17.1 변환 결과
  * - 사용자 필드가 더 많으면 초과 필드는 NULL, 더 적으면 초과 파일 컬럼은 읽지 않음
  */
 public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
@@ -30,6 +31,10 @@ public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
 
     /** parquet-avro 내부의 read schema 설정 키 (AvroReadSupport.AVRO_READ_SCHEMA와 동일) */
     private static final String AVRO_READ_SCHEMA_KEY = "parquet.avro.read.schema";
+
+    /** 파일 footer에 내장된 Avro 스키마 키 (신규 / 구버전, AvroReadSupport와 동일한 우선순위) */
+    private static final String EMBEDDED_SCHEMA_KEY = "parquet.avro.schema";
+    private static final String OLD_EMBEDDED_SCHEMA_KEY = "avro.schema";
 
     public PositionalAvroReadSupport() {
         super();
@@ -55,10 +60,13 @@ public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
         final int n = userFields.size();
         final int k = Math.min(n, fileColumns.size());
 
+        // 0) 파일 내장 Avro 스키마 (기존 ParquetReader가 타입을 얻는 곳)
+        final Schema embeddedSchema = parseEmbeddedSchema(keyValueMetaData);
+
         // 1) projection: 파일의 앞 k개 컬럼만 읽음 (원본 이름 유지)
         final MessageType projection = new MessageType(fileSchema.getName(), new ArrayList<>(fileColumns.subList(0, k)));
 
-        // 2) 이름만 사용자 이름으로 바꾼 사본을 1.17.1 변환기로 Avro 타입 변환
+        // 2) 이름만 사용자 이름으로 바꾼 사본을 1.17.1 변환기로 Avro 타입 변환 (2순위용)
         Schema fileTyped = null;
         if (k > 0) {
             final List<Type> renamed = new ArrayList<>(k);
@@ -73,9 +81,21 @@ public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
         for (int i = 0; i < n; i++) {
             final String name = userFields.get(i).name();
             if (i < k) {
-                final Schema typeFromFile = fileTyped.getField(name).schema();
-                final Schema.Field field = new Schema.Field(name, typeFromFile, null, (Object) null);
                 final String originalName = fileColumns.get(i).getName();
+
+                // 1순위: 내장 스키마의 타입, 2순위: 변환기 결과
+                Schema typeFromFile = null;
+                if (embeddedSchema != null) {
+                    final Schema.Field embeddedField = embeddedSchema.getField(originalName);
+                    if (embeddedField != null) {
+                        typeFromFile = embeddedField.schema();
+                    }
+                }
+                if (typeFromFile == null) {
+                    typeFromFile = fileTyped.getField(name).schema();
+                }
+
+                final Schema.Field field = new Schema.Field(name, typeFromFile, null, (Object) null);
                 if (!name.equals(originalName)) {
                     field.addAlias(originalName);
                 }
@@ -94,6 +114,26 @@ public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
         conf.set(AVRO_READ_SCHEMA_KEY, readSchema.toString());
         final ReadSupport.ReadContext base = super.init(conf, keyValueMetaData, projection);
         return new ReadSupport.ReadContext(projection, base.getReadSupportMetadata());
+    }
+
+    /** 내장 Avro 스키마 파싱. 없거나 파싱할 수 없으면(예: '$' 컬럼명) null → 변환기 결과 사용 */
+    private static Schema parseEmbeddedSchema(final Map<String, String> keyValueMetaData) {
+        if (keyValueMetaData == null) {
+            return null;
+        }
+        String text = keyValueMetaData.get(EMBEDDED_SCHEMA_KEY);
+        if (text == null) {
+            text = keyValueMetaData.get(OLD_EMBEDDED_SCHEMA_KEY);
+        }
+        if (text == null) {
+            return null;
+        }
+        try {
+            final Schema schema = new Schema.Parser().parse(text);
+            return schema.getType() == Schema.Type.RECORD ? schema : null;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** 이름만 바꾸고 repetition, 물리 타입, 길이, 논리 타입(decimal 등)은 유지 */
