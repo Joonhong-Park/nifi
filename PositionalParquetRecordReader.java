@@ -5,28 +5,41 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.nifi.avro.AvroTypeUtil;
 import org.apache.nifi.parquet.stream.NifiParquetInputFile;
 import org.apache.nifi.serialization.RecordReader;
+import org.apache.nifi.serialization.SimpleRecordSchema;
 import org.apache.nifi.serialization.record.MapRecord;
 import org.apache.nifi.serialization.record.Record;
+import org.apache.nifi.serialization.record.RecordField;
+import org.apache.nifi.serialization.record.RecordFieldType;
 import org.apache.nifi.serialization.record.RecordSchema;
 import org.apache.parquet.hadoop.ParquetReader;
 import org.apache.parquet.io.InputFile;
+import org.apache.parquet.schema.LogicalTypeAnnotation;
 
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
  * NiFi 1.23.2 ParquetRecordReader 기반.
- * Parquet 읽기에 PositionalParquetReaderBuilder(→ PositionalAvroReadSupport)를 사용한다.
+ * - Parquet 읽기에 PositionalParquetReaderBuilder(→ PositionalAvroReadSupport)를 사용
+ * - INT32/INT64 decimal 필드는 DECIMAL(precision, scale) 타입과 BigDecimal 값으로 변환
  */
 public class PositionalParquetRecordReader implements RecordReader {
 
     private GenericRecord lastParquetRecord;
+    /** NiFi에 노출하는 스키마 (decimal 필드는 DECIMAL 타입) */
     private final RecordSchema recordSchema;
+    /** Avro 스키마 그대로의 NiFi 스키마 (decimal 외 필드 값 변환용) */
+    private final RecordSchema avroRecordSchema;
+    /** INT32/INT64 decimal 필드명 → scale */
+    private final Map<String, Integer> decimalScales = new HashMap<>();
 
     private final InputStream inputStream;
-    private final InputFile inputFile;
     private final ParquetReader<GenericRecord> parquetReader;
 
     public PositionalParquetRecordReader(final InputStream inputStream, final long inputLength,
@@ -38,17 +51,24 @@ public class PositionalParquetRecordReader implements RecordReader {
 
         this.inputStream = inputStream;
 
-        inputFile = new NifiParquetInputFile(inputStream, inputLength);
-        parquetReader = new PositionalParquetReaderBuilder(inputFile).withConf(configuration).build();
+        final InputFile inputFile = new NifiParquetInputFile(inputStream, inputLength);
+        final PositionalParquetReaderBuilder builder = new PositionalParquetReaderBuilder(inputFile);
+        parquetReader = builder.withConf(configuration).build();
 
-        // 첫 레코드를 읽어 스키마를 얻음 (원본과 동일)
+        // 첫 레코드를 읽어 스키마를 얻음 (이 시점에 ReadSupport.init()이 실행됨)
         lastParquetRecord = parquetReader.read();
         if (lastParquetRecord == null) {
             throw new EOFException("레코드가 없어 스키마를 가져올 수 없습니다 (0건 Parquet 파일)");
         }
 
         // Avro 스키마(사용자 이름 + 파일 타입) → NiFi RecordSchema
-        recordSchema = AvroTypeUtil.createSchema(lastParquetRecord.getSchema());
+        avroRecordSchema = AvroTypeUtil.createSchema(lastParquetRecord.getSchema());
+
+        // INT32/INT64 decimal 필드는 DECIMAL(precision, scale)로 교체
+        final Map<String, LogicalTypeAnnotation.DecimalLogicalTypeAnnotation> decimals =
+                builder.getPositionalReadSupport().getIntegerDecimalFields();
+        decimals.forEach((name, d) -> decimalScales.put(name, d.getScale()));
+        recordSchema = applyDecimalTypes(avroRecordSchema, decimals);
     }
 
     @Override
@@ -57,7 +77,16 @@ public class PositionalParquetRecordReader implements RecordReader {
             return null;
         }
 
-        final Map<String, Object> values = AvroTypeUtil.convertAvroRecordToMap(lastParquetRecord, recordSchema);
+        Map<String, Object> values = AvroTypeUtil.convertAvroRecordToMap(lastParquetRecord, avroRecordSchema);
+
+        // decimal 필드는 NiFi 변환 결과 대신 원본 값에서 BigDecimal 생성
+        if (!decimalScales.isEmpty()) {
+            values = new HashMap<>(values);
+            for (Map.Entry<String, Integer> e : decimalScales.entrySet()) {
+                values.put(e.getKey(), toDecimal(lastParquetRecord.get(e.getKey()), e.getValue(), e.getKey()));
+            }
+        }
+
         final Record record = new MapRecord(recordSchema, values);
 
         lastParquetRecord = parquetReader.read();
@@ -77,5 +106,40 @@ public class PositionalParquetRecordReader implements RecordReader {
         } finally {
             inputStream.close();
         }
+    }
+
+    /** parquet-avro 원본 값 → BigDecimal (BigDecimal이면 그대로, 정수면 unscaled 값으로 보고 scale 적용) */
+    private static BigDecimal toDecimal(final Object raw, final int scale, final String fieldName) {
+        if (raw == null) {
+            return null;
+        }
+        if (raw instanceof BigDecimal) {
+            return (BigDecimal) raw;
+        }
+        if (raw instanceof Long || raw instanceof Integer) {
+            return BigDecimal.valueOf(((Number) raw).longValue(), scale);
+        }
+        throw new IllegalStateException("decimal 필드 값 형식을 처리할 수 없습니다: 필드=" + fieldName
+                + ", 타입=" + raw.getClass().getName());
+    }
+
+    /** decimal 필드의 NiFi 타입을 DECIMAL(precision, scale)로 교체한 스키마 생성 */
+    private static RecordSchema applyDecimalTypes(final RecordSchema schema,
+            final Map<String, LogicalTypeAnnotation.DecimalLogicalTypeAnnotation> decimals) {
+        if (decimals.isEmpty()) {
+            return schema;
+        }
+        final List<RecordField> fields = new ArrayList<>();
+        for (RecordField f : schema.getFields()) {
+            final LogicalTypeAnnotation.DecimalLogicalTypeAnnotation d = decimals.get(f.getFieldName());
+            if (d == null) {
+                fields.add(f);
+            } else {
+                fields.add(new RecordField(f.getFieldName(),
+                        RecordFieldType.DECIMAL.getDecimalDataType(d.getPrecision(), d.getScale()),
+                        f.getDefaultValue(), f.getAliases(), f.isNullable()));
+            }
+        }
+        return new SimpleRecordSchema(fields);
     }
 }
