@@ -5,6 +5,7 @@ import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.controller.AbstractControllerService;
+import org.apache.nifi.controller.ConfigurationContext;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.parquet.utils.ParquetConfig;
@@ -49,16 +50,16 @@ public class PositionalParquetReader extends AbstractControllerService implement
     @Override
     public RecordReader createRecordReader(final Map<String, String> variables, final InputStream in,
                                            final long inputLength, final ComponentLog logger) throws IOException {
+        final ConfigurationContext context = getConfigurationContext();
 
-        final String schemaText = getConfigurationContext().getProperty(SCHEMA_TEXT)
-                .evaluateAttributeExpressions(variables).getValue();
+        final String schemaText = context.getProperty(SCHEMA_TEXT).evaluateAttributeExpressions(variables).getValue();
         if (schemaText == null || schemaText.trim().isEmpty()) {
             throw new IllegalArgumentException("Schema Text 평가 결과가 비어 있습니다. FlowFile 속성 값을 확인하세요.");
         }
 
         // 기본 ParquetReader와 동일한 공통 설정 (Avro Read Compatibility, INT96 → fixed 등)
         final Configuration conf = new Configuration();
-        final ParquetConfig parquetConfig = ParquetUtils.createParquetConfig(getConfigurationContext(), variables);
+        final ParquetConfig parquetConfig = ParquetUtils.createParquetConfig(context, variables);
         ParquetUtils.applyCommonConfig(conf, parquetConfig);
 
         // 사용자 스키마 전달 → PositionalAvroReadSupport.init()에서 사용

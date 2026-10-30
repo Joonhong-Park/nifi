@@ -23,7 +23,7 @@ import java.util.Map;
  * 사용자 스키마의 필드 순서대로 Parquet 컬럼을 매핑하는 ReadSupport (parquet 1.13.1 기준).
  * <ul>
  *   <li>이름: 사용자 스키마 i번째 필드명 ← 파일 i번째 컬럼 (원본 컬럼명은 alias로 부여, read schema 내부 전용)</li>
- *   <li>타입: 1순위 파일 내장 Avro 스키마, 2순위 AvroSchemaConverter 변환 결과 (임시 이름으로 변환 후 위치로 조회)</li>
+ *   <li>타입: 1순위 파일 내장 Avro 스키마, 2순위 AvroSchemaConverter 변환 결과 (필요한 컬럼만, 임시 이름으로 변환)</li>
  *   <li>사용자 필드가 더 많으면 초과 필드는 NULL, 더 적으면 초과 파일 컬럼은 읽지 않음</li>
  *   <li>INT32/INT64 decimal 컬럼은 precision/scale을 기록 → RecordReader가 DECIMAL로 변환</li>
  * </ul>
@@ -40,7 +40,7 @@ public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
     /**
      * 변환기에 넘길 임시 컬럼명 접두어.
      * 변환기는 FIXED/INT96/group 컬럼의 Avro 타입 이름에 컬럼명을 쓰는데, 'bytes', 'int' 같은
-     * Avro 기본 타입 이름은 타입 이름으로 쓸 수 없으므로 위치 기반 임시 이름을 사용한다.
+     * Avro 기본 타입 이름이나 '$' 등은 타입 이름으로 쓸 수 없으므로 위치 기반 임시 이름을 사용한다.
      */
     private static final String TEMP_COLUMN_PREFIX = "pq_col_";
 
@@ -68,9 +68,9 @@ public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
         final MessageType projection = new MessageType(fileSchema.getName(),
                 new ArrayList<>(fileColumns.subList(0, mappedCount)));
 
-        // 2) 타입 결정용 스키마: 내장 Avro 스키마(1순위), 임시 이름 사본의 변환 결과(2순위, 위치로 조회)
-        final Schema embeddedSchema = parseEmbeddedSchema(keyValueMetaData);
-        final Schema convertedSchema = convertForTypes(conf, fileSchema.getName(), fileColumns, mappedCount);
+        // 2) 파일 컬럼 타입 결정: 내장 Avro 스키마 우선, 나머지만 변환기 실행
+        final Schema[] columnTypes = resolveColumnTypes(conf, fileSchema.getName(), fileColumns, mappedCount,
+                parseEmbeddedSchema(keyValueMetaData));
 
         // 3) read schema 조립
         final List<Schema.Field> readFields = new ArrayList<>(userFieldCount);
@@ -78,7 +78,7 @@ public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
             final String name = userFields.get(i).name();
             if (i < mappedCount) {
                 final Type column = fileColumns.get(i);
-                readFields.add(buildMappedField(name, i, column, embeddedSchema, convertedSchema));
+                readFields.add(buildMappedField(name, column, columnTypes[i]));
                 recordIntegerDecimal(name, column);
             } else {
                 // 파일에 없는 필드: 사용자 타입을 nullable로 바꾸고 기본값 null
@@ -128,41 +128,43 @@ public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
     }
 
     /**
-     * 앞 mappedCount개 컬럼의 이름을 임시 이름(pq_col_i)으로 바꾼 사본을 Avro로 변환.
-     * 원본 이름('$' 등)이나 사용자 이름('bytes', 'int' 등)으로 인한 Avro 이름 규칙 오류를 모두 피한다.
-     * 결과 필드는 위치(i)로 조회한다.
+     * 앞 mappedCount개 컬럼의 Avro 타입 결정.
+     * 1순위: 내장 Avro 스키마에서 원본 컬럼명으로 찾은 타입
+     * 2순위: 1순위로 얻지 못한 컬럼만 임시 이름(pq_col_i)으로 바꿔 변환기로 변환 후 임시 이름으로 조회
+     *        (모두 1순위로 해결되면 변환기를 실행하지 않음)
      */
-    private static Schema convertForTypes(final Configuration conf, final String messageName,
-                                          final List<Type> fileColumns, final int mappedCount) {
-        if (mappedCount == 0) {
-            return null;
-        }
-        final List<Type> renamed = new ArrayList<>(mappedCount);
+    private static Schema[] resolveColumnTypes(final Configuration conf, final String messageName,
+                                               final List<Type> fileColumns, final int mappedCount,
+                                               final Schema embeddedSchema) {
+        final Schema[] types = new Schema[mappedCount];
+        final List<Type> toConvert = new ArrayList<>();
+
         for (int i = 0; i < mappedCount; i++) {
-            renamed.add(rename(fileColumns.get(i), TEMP_COLUMN_PREFIX + i));
-        }
-        return new AvroSchemaConverter(conf).convert(new MessageType(messageName, renamed));
-    }
-
-    /** 파일에 있는 컬럼의 read schema 필드 생성: 이름=사용자 이름, 타입=내장 스키마 우선(없으면 변환 결과의 i번째), alias=원본 컬럼명 */
-    private static Schema.Field buildMappedField(final String name, final int index, final Type column,
-                                                 final Schema embeddedSchema, final Schema convertedSchema) {
-        final String originalName = column.getName();
-
-        Schema type = null;
-        if (embeddedSchema != null) {
-            final Schema.Field embeddedField = embeddedSchema.getField(originalName);
+            final Type column = fileColumns.get(i);
+            final Schema.Field embeddedField = (embeddedSchema == null) ? null : embeddedSchema.getField(column.getName());
             if (embeddedField != null) {
-                type = embeddedField.schema();
+                types[i] = embeddedField.schema();
+            } else {
+                toConvert.add(rename(column, TEMP_COLUMN_PREFIX + i));
             }
         }
-        if (type == null) {
-            type = convertedSchema.getFields().get(index).schema();   // 임시 이름이므로 위치로 조회
-        }
 
+        if (!toConvert.isEmpty()) {
+            final Schema converted = new AvroSchemaConverter(conf).convert(new MessageType(messageName, toConvert));
+            for (int i = 0; i < mappedCount; i++) {
+                if (types[i] == null) {
+                    types[i] = converted.getField(TEMP_COLUMN_PREFIX + i).schema();
+                }
+            }
+        }
+        return types;
+    }
+
+    /** 파일에 있는 컬럼의 read schema 필드: 이름=사용자 이름, alias=원본 컬럼명(다를 때만, parquet 컬럼 연결용) */
+    private static Schema.Field buildMappedField(final String name, final Type column, final Schema type) {
         final Schema.Field field = new Schema.Field(name, type, null, (Object) null);
-        if (!name.equals(originalName)) {
-            field.addAlias(originalName);   // parquet 컬럼 연결용 (NiFi 노출 스키마에는 포함되지 않음)
+        if (!name.equals(column.getName())) {
+            field.addAlias(column.getName());
         }
         return field;
     }
