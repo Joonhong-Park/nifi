@@ -56,14 +56,46 @@ import static org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT96;
 
 /**
  * 진단용 (jar에 포함하지 않음, 확인 후 C:\nifi-dev\diag\로 이동).
- * 요구사항 전체(CLAUDE.md 9번 A01~E25)를 자동 검증하고 PASS/FAIL 요약만 출력한다.
+ * 요구사항 전체(CLAUDE.md 9번 A01~E25)를 검증하고 항목별 "테스트 내용 : 실제 결과"를 한 줄씩 출력한다.
  * 실행 인자(선택): 테스트 파일을 만들 폴더 (기본: 프로젝트 폴더)
  */
 public class Verify3 {
 
+    /** 항목 ID → 테스트 내용(입력 데이터), 출력 순서 */
+    private static final Map<String, String> DESC = new LinkedHashMap<>();
+
+    static {
+        DESC.put("A01", "a$b BINARY문자열 → a_b");
+        DESC.put("A02", "UPPER_COL INT32 → upper_col");
+        DESC.put("A03", "'col_1' BINARY문자열 → col_1");
+        DESC.put("A04", "col/2 INT64 → col_2");
+        DESC.put("A05", "col$3 DOUBLE → col_3");
+        DESC.put("A06", "1col BOOLEAN → col1");
+        DESC.put("A07", "AMT INT64 DEC(10,3) 6000/6125/-1500 → amt");
+        DESC.put("A08", "AMT32 INT32 DEC(9,2) 1234 → amt32");
+        DESC.put("A09", "bytes FIXED16 DEC(38,0) → bytes");
+        DESC.put("A10", "int FIXED16 DEC(38,15) → int");
+        DESC.put("A11", "F3 bytes/int BINARY DEC(38,0)/(38,15)");
+        DESC.put("A12", "F6 bytes INT64 7 / int 문자열 s");
+        DESC.put("A13", "RAW BINARY {1,2,3} → raw");
+        DESC.put("A14", "F1 4번째 행 전부 null");
+        DESC.put("B15", "사용자 12개(+extra long) / 파일 11개");
+        DESC.put("B16", "사용자 3개 / 파일 11개");
+        DESC.put("C17", "내장스키마 NOTE=string, BINARY → note");
+        DESC.put("C18", "내장스키마 파싱불가(N$OTE) → note");
+        DESC.put("D19", "avro.schema·NiFi 필드명/순서");
+        DESC.put("D20", "alias·pq_col_ 없음");
+        DESC.put("D21", "avro decimal 표시");
+        DESC.put("D22", "avro raw 타입");
+        DESC.put("D23", "record 이름 F1/F3/F6");
+        DESC.put("D24", "avro.schema 재파싱");
+        DESC.put("E25", "INT96 ts {1..12} 기본 Reader 비교");
+    }
+
     /** 검증 결과: ID → 성공 여부 (같은 ID가 여러 번 검사되면 모두 성공해야 PASS) */
     private static final Map<String, Boolean> RESULTS = new LinkedHashMap<>();
-    private static final List<String> ERRORS = new ArrayList<>();
+    /** 검증 결과: ID → 실제 결과 (여러 번 검사되면 ", "로 연결) */
+    private static final Map<String, String> ACTUAL = new LinkedHashMap<>();
 
     /** F1 사용자 필드명 (파일 컬럼 순서와 같음) */
     private static final String[] U1 = {"a_b", "upper_col", "col_1", "col_2", "col_3", "col1",
@@ -79,8 +111,10 @@ public class Verify3 {
         final Schema avro1 = caseF1(f1);
         final Schema avro3 = caseF3(new File(dir, "v3_f3.parquet"));
         final Schema avro6 = caseF6(new File(dir, "v3_f6.parquet"));
-        check("D23", avro1 != null && avro3 != null && avro6 != null
-                && avro1.getFullName().equals(avro3.getFullName()) && avro1.getFullName().equals(avro6.getFullName()));
+        final String n1 = avro1 == null ? "-" : avro1.getFullName();
+        final String n3 = avro3 == null ? "-" : avro3.getFullName();
+        final String n6 = avro6 == null ? "-" : avro6.getFullName();
+        check("D23", avro1 != null && n1.equals(n3) && n1.equals(n6), n1 + " / " + n3 + " / " + n6);
 
         caseB15(f1);
         caseB16(f1);
@@ -88,23 +122,25 @@ public class Verify3 {
         caseC18(new File(dir, "v3_f5.parquet"));
         caseE25(new File(dir, "v3_f7.parquet"));
 
+        // 항목별 출력
         int pass = 0;
-        final List<String> fails = new ArrayList<>();
-        for (Map.Entry<String, Boolean> e : RESULTS.entrySet()) {
-            if (e.getValue()) {
+        for (Map.Entry<String, String> d : DESC.entrySet()) {
+            final String id = d.getKey();
+            final Boolean ok = RESULTS.get(id);
+            final String status = ok == null ? "SKIP" : (ok ? "PASS" : "FAIL");
+            if (Boolean.TRUE.equals(ok)) {
                 pass++;
-            } else {
-                fails.add(e.getKey());
+            }
+            System.out.println(status + " " + id + " " + d.getValue() + " : "
+                    + (ok == null ? "미실행(케이스 오류)" : ACTUAL.get(id)));
+        }
+        // 케이스 전체 오류 (F1, F3, F6 등)
+        for (Map.Entry<String, Boolean> e : RESULTS.entrySet()) {
+            if (!DESC.containsKey(e.getKey())) {
+                System.out.println("FAIL " + e.getKey() + " : " + ACTUAL.get(e.getKey()));
             }
         }
-        Collections.sort(fails);
-        System.out.println("결과: PASS " + pass + " / FAIL " + fails.size() + " (기대 PASS 25)");
-        if (!fails.isEmpty()) {
-            System.out.println("FAIL: " + String.join(" ", fails));
-        }
-        if (!ERRORS.isEmpty()) {
-            System.out.println("오류: " + String.join(" / ", ERRORS));
-        }
+        System.out.println("결과: PASS " + pass + " / FAIL " + (DESC.size() - pass) + " (기대 PASS 25)");
     }
 
     // ===================================================================== 케이스
@@ -140,27 +176,43 @@ public class Verify3 {
             final ReadResult r = readCustom(f, recordJson(fields(U1)));
             final RecordSchema rs = r.schema;
             final Record r0 = r.rows.get(0);
-            check("A01", isType(rs, "a_b", RecordFieldType.STRING) && strEq(r0.getValue("a_b"), "hello"));
-            check("A02", isType(rs, "upper_col", RecordFieldType.INT) && Objects.equals(r0.getValue("upper_col"), 42));
-            check("A03", isType(rs, "col_1", RecordFieldType.STRING) && strEq(r0.getValue("col_1"), "x"));
-            check("A04", isType(rs, "col_2", RecordFieldType.LONG) && Objects.equals(r0.getValue("col_2"), 9000000000L));
-            check("A05", isType(rs, "col_3", RecordFieldType.DOUBLE) && Objects.equals(r0.getValue("col_3"), 1.5d));
-            check("A06", isType(rs, "col1", RecordFieldType.BOOLEAN) && Objects.equals(r0.getValue("col1"), true));
+            check("A01", isType(rs, "a_b", RecordFieldType.STRING) && strEq(r0.getValue("a_b"), "hello"),
+                    tv(rs, r0, "a_b"));
+            check("A02", isType(rs, "upper_col", RecordFieldType.INT) && Objects.equals(r0.getValue("upper_col"), 42),
+                    tv(rs, r0, "upper_col"));
+            check("A03", isType(rs, "col_1", RecordFieldType.STRING) && strEq(r0.getValue("col_1"), "x"),
+                    tv(rs, r0, "col_1"));
+            check("A04", isType(rs, "col_2", RecordFieldType.LONG) && Objects.equals(r0.getValue("col_2"), 9000000000L),
+                    tv(rs, r0, "col_2"));
+            check("A05", isType(rs, "col_3", RecordFieldType.DOUBLE) && Objects.equals(r0.getValue("col_3"), 1.5d),
+                    tv(rs, r0, "col_3"));
+            check("A06", isType(rs, "col1", RecordFieldType.BOOLEAN) && Objects.equals(r0.getValue("col1"), true),
+                    tv(rs, r0, "col1"));
             check("A07", isDecimal(rs, "amt", 10, 3) && r.rows.size() == 4
-                    && decEq(r.rows.get(0).getValue("amt"), "6.000")
-                    && decEq(r.rows.get(1).getValue("amt"), "6.125")
-                    && decEq(r.rows.get(2).getValue("amt"), "-1.500"));
-            check("A08", isDecimal(rs, "amt32", 9, 2) && decEq(r0.getValue("amt32"), "12.34"));
-            check("A09", isDecimal(rs, "bytes", 38, 0) && decEq(r0.getValue("bytes"), "20261011220351"));
-            check("A10", isDecimal(rs, "int", 38, 15) && decEq(r0.getValue("int"), "123.456789012345678"));
-            check("A13", Arrays.equals(bytesOf(r0.getValue("raw")), new byte[]{1, 2, 3}));
-            check("A14", r.rows.size() == 4 && allNull(r.rows.get(3), U1));
+                            && decEq(r.rows.get(0).getValue("amt"), "6.000")
+                            && decEq(r.rows.get(1).getValue("amt"), "6.125")
+                            && decEq(r.rows.get(2).getValue("amt"), "-1.500"),
+                    typeOf(rs, "amt") + " " + v(r.rows.get(0).getValue("amt")) + ", "
+                            + v(r.rows.get(1).getValue("amt")) + ", " + v(r.rows.get(2).getValue("amt")));
+            check("A08", isDecimal(rs, "amt32", 9, 2) && decEq(r0.getValue("amt32"), "12.34"),
+                    tv(rs, r0, "amt32"));
+            check("A09", isDecimal(rs, "bytes", 38, 0) && decEq(r0.getValue("bytes"), "20261011220351"),
+                    tv(rs, r0, "bytes"));
+            check("A10", isDecimal(rs, "int", 38, 15) && decEq(r0.getValue("int"), "123.456789012345678"),
+                    tv(rs, r0, "int"));
+            check("A13", Arrays.equals(bytesOf(r0.getValue("raw")), new byte[]{1, 2, 3}),
+                    tv(rs, r0, "raw"));
+            check("A14", r.rows.size() == 4 && allNull(r.rows.get(3), U1),
+                    "행 " + r.rows.size() + "개, 4번째 행 값 있는 필드 " + nonNullCount(r.rows.get(r.rows.size() - 1), U1) + "개");
 
-            checkAvroCommon(r, U1);
+            checkAvroCommon("F1", r, U1);
             check("D21", avroDecimal(r.avro, "amt", 10, 3) && avroDecimal(r.avro, "amt32", 9, 2)
-                    && avroDecimal(r.avro, "bytes", 38, 0) && avroDecimal(r.avro, "int", 38, 15));
+                            && avroDecimal(r.avro, "bytes", 38, 0) && avroDecimal(r.avro, "int", 38, 15),
+                    "F1 amt=" + at(r.avro, "amt") + " amt32=" + at(r.avro, "amt32")
+                            + " bytes=" + at(r.avro, "bytes") + " int=" + at(r.avro, "int"));
             final Schema raw = nonNull(r.avro.getField("raw").schema());
-            check("D22", raw.getType() == Schema.Type.BYTES && raw.getLogicalType() == null);
+            check("D22", raw.getType() == Schema.Type.BYTES && raw.getLogicalType() == null,
+                    "raw=" + r.avro.getField("raw").schema());
             return r.avro;
         } catch (Throwable t) {
             error("F1", t);
@@ -185,11 +237,14 @@ public class Verify3 {
             final ReadResult r = readCustom(f, recordJson(fields(names)));
             final Record r0 = r.rows.get(0);
             check("A11", isDecimal(r.schema, "bytes", 38, 0) && isDecimal(r.schema, "int", 38, 15)
-                    && decEq(r0.getValue("bytes"), "20261011220351")
-                    && decEq(r0.getValue("int"), "123.456789012345678")
-                    && allNull(r.rows.get(1), names));
-            checkAvroCommon(r, names);
-            check("D21", avroDecimal(r.avro, "bytes", 38, 0) && avroDecimal(r.avro, "int", 38, 15));
+                            && decEq(r0.getValue("bytes"), "20261011220351")
+                            && decEq(r0.getValue("int"), "123.456789012345678")
+                            && allNull(r.rows.get(1), names),
+                    "bytes " + tv(r.schema, r0, "bytes") + ", int " + tv(r.schema, r0, "int")
+                            + ", null행 " + (allNull(r.rows.get(1), names) ? "null" : "값있음"));
+            checkAvroCommon("F3", r, names);
+            check("D21", avroDecimal(r.avro, "bytes", 38, 0) && avroDecimal(r.avro, "int", 38, 15),
+                    "F3 bytes=" + at(r.avro, "bytes") + " int=" + at(r.avro, "int"));
             return r.avro;
         } catch (Throwable t) {
             error("F3", t);
@@ -212,8 +267,9 @@ public class Verify3 {
             final ReadResult r = readCustom(f, recordJson(fields(names)));
             final Record r0 = r.rows.get(0);
             check("A12", isType(r.schema, "bytes", RecordFieldType.LONG) && Objects.equals(r0.getValue("bytes"), 7L)
-                    && isType(r.schema, "int", RecordFieldType.STRING) && strEq(r0.getValue("int"), "s"));
-            checkAvroCommon(r, names);
+                            && isType(r.schema, "int", RecordFieldType.STRING) && strEq(r0.getValue("int"), "s"),
+                    "bytes " + tv(r.schema, r0, "bytes") + ", int " + tv(r.schema, r0, "int"));
+            checkAvroCommon("F6", r, names);
             return r.avro;
         } catch (Throwable t) {
             error("F6", t);
@@ -230,16 +286,22 @@ public class Verify3 {
             names[U1.length] = "extra";
 
             final ReadResult r = readCustom(f1, recordJson(fieldJsons));
-            boolean extraNull = true;
+            int extraNull = 0;
             for (Record rec : r.rows) {
-                extraNull &= rec.getValue("extra") == null;
+                if (rec.getValue("extra") == null) {
+                    extraNull++;
+                }
             }
-            check("B15", r.schema.getFieldCount() == 12 && extraNull
-                    && isType(r.schema, "extra", RecordFieldType.LONG)
-                    && nonNull(r.avro.getField("extra").schema()).getType() == Schema.Type.LONG
-                    && decEq(r.rows.get(0).getValue("amt"), "6.000")
-                    && Arrays.equals(bytesOf(r.rows.get(0).getValue("raw")), new byte[]{1, 2, 3}));
-            checkAvroCommon(r, names);
+            final Record r0 = r.rows.get(0);
+            check("B15", r.schema.getFieldCount() == 12 && extraNull == r.rows.size()
+                            && isType(r.schema, "extra", RecordFieldType.LONG)
+                            && nonNull(r.avro.getField("extra").schema()).getType() == Schema.Type.LONG
+                            && decEq(r0.getValue("amt"), "6.000")
+                            && Arrays.equals(bytesOf(r0.getValue("raw")), new byte[]{1, 2, 3}),
+                    "필드 " + r.schema.getFieldCount() + "개, extra " + typeOf(r.schema, "extra")
+                            + " null " + extraNull + "/" + r.rows.size()
+                            + ", amt " + v(r0.getValue("amt")) + ", raw " + v(r0.getValue("raw")));
+            checkAvroCommon("B15", r, names);
         } catch (Throwable t) {
             error("B15", t);
         }
@@ -252,10 +314,12 @@ public class Verify3 {
             final ReadResult r = readCustom(f1, recordJson(fields(names)));
             final Record r0 = r.rows.get(0);
             check("B16", r.schema.getFieldCount() == 3 && r.rows.size() == 4
-                    && strEq(r0.getValue("a_b"), "hello")
-                    && Objects.equals(r0.getValue("upper_col"), 42)
-                    && strEq(r0.getValue("col_1"), "x"));
-            checkAvroCommon(r, names);
+                            && strEq(r0.getValue("a_b"), "hello")
+                            && Objects.equals(r0.getValue("upper_col"), 42)
+                            && strEq(r0.getValue("col_1"), "x"),
+                    "필드 " + r.schema.getFieldCount() + "개, 행 " + r.rows.size() + "개, "
+                            + v(r0.getValue("a_b")) + ", " + v(r0.getValue("upper_col")) + ", " + v(r0.getValue("col_1")));
+            checkAvroCommon("B16", r, names);
         } catch (Throwable t) {
             error("B16", t);
         }
@@ -277,8 +341,10 @@ public class Verify3 {
 
             final String[] names = {"id", "note"};
             final ReadResult r = readCustom(f, recordJson(fields(names)));
-            check("C17", isType(r.schema, "note", RecordFieldType.STRING) && strEq(r.rows.get(0).getValue("note"), "memo"));
-            checkAvroCommon(r, names);
+            final Record r0 = r.rows.get(0);
+            check("C17", isType(r.schema, "note", RecordFieldType.STRING) && strEq(r0.getValue("note"), "memo"),
+                    tv(r.schema, r0, "note"));
+            checkAvroCommon("C17", r, names);
         } catch (Throwable t) {
             error("C17", t);
         }
@@ -300,9 +366,11 @@ public class Verify3 {
 
             final String[] names = {"id", "note"};
             final ReadResult r = readCustom(f, recordJson(fields(names)));
+            final Record r0 = r.rows.get(0);
             check("C18", isType(r.schema, "note", RecordFieldType.ARRAY)
-                    && Arrays.equals(bytesOf(r.rows.get(0).getValue("note")), "memo".getBytes(StandardCharsets.UTF_8)));
-            checkAvroCommon(r, names);
+                            && Arrays.equals(bytesOf(r0.getValue("note")), "memo".getBytes(StandardCharsets.UTF_8)),
+                    tv(r.schema, r0, "note"));
+            checkAvroCommon("C18", r, names);
         } catch (Throwable t) {
             error("C18", t);
         }
@@ -323,10 +391,14 @@ public class Verify3 {
             final String[] names = {"ts", "id"};
             final ReadResult custom = readCustom(f, recordJson(fields(names)));
             final ReadResult base = readBase(f);
-            check("E25", Arrays.equals(bytesOf(custom.rows.get(0).getValue("ts")), ts)
-                    && Arrays.equals(bytesOf(base.rows.get(0).getValue("ts")), ts)
-                    && Objects.equals(custom.rows.get(0).getValue("id"), base.rows.get(0).getValue("id")));
-            checkAvroCommon(custom, names);
+            final Record c0 = custom.rows.get(0);
+            final Record b0 = base.rows.get(0);
+            check("E25", Arrays.equals(bytesOf(c0.getValue("ts")), ts)
+                            && Arrays.equals(bytesOf(b0.getValue("ts")), ts)
+                            && Objects.equals(c0.getValue("id"), b0.getValue("id")),
+                    "커스텀 ts " + v(c0.getValue("ts")) + " id " + v(c0.getValue("id"))
+                            + " / 기본 ts " + v(b0.getValue("ts")) + " id " + v(b0.getValue("id")));
+            checkAvroCommon("E25", custom, names);
         } catch (Throwable t) {
             error("E25", t);
         }
@@ -335,28 +407,34 @@ public class Verify3 {
     // ===================================================================== 공통 검사
 
     /** D19 필드명·순서, D20 alias/내부 이름 없음, D24 재파싱 */
-    private static void checkAvroCommon(final ReadResult r, final String[] names) {
+    private static void checkAvroCommon(final String label, final ReadResult r, final String[] names) {
         final List<String> avroNames = new ArrayList<>();
         for (Schema.Field fld : r.avro.getFields()) {
             avroNames.add(fld.name());
         }
-        check("D19", avroNames.equals(Arrays.asList(names)) && r.schema.getFieldNames().equals(Arrays.asList(names)));
+        final boolean namesOk = avroNames.equals(Arrays.asList(names)) && r.schema.getFieldNames().equals(Arrays.asList(names));
+        check("D19", namesOk, label + (namesOk ? " " + names.length + "개 일치" : " 불일치 avro=" + avroNames
+                + " nifi=" + r.schema.getFieldNames()));
 
-        boolean noNifiAlias = true;
+        int nifiAlias = 0;
         for (RecordField fld : r.schema.getFields()) {
-            noNifiAlias &= fld.getAliases().isEmpty();
+            nifiAlias += fld.getAliases().size();
         }
         final String text = r.avro.toString();
-        check("D20", noNifiAlias && !text.contains("\"aliases\"") && !text.contains("pq_col_"));
+        final boolean hasAliases = text.contains("\"aliases\"");
+        final boolean hasTemp = text.contains("pq_col_");
+        check("D20", nifiAlias == 0 && !hasAliases && !hasTemp, label
+                + (nifiAlias == 0 && !hasAliases && !hasTemp ? " 없음"
+                : " 있음(NiFi alias " + nifiAlias + ", avro aliases " + hasAliases + ", pq_col_ " + hasTemp + ")"));
 
-        boolean reparsed;
+        String reparse;
         try {
             new Schema.Parser().parse(text);
-            reparsed = true;
+            reparse = null;
         } catch (Exception e) {
-            reparsed = false;
+            reparse = e.getClass().getSimpleName();
         }
-        check("D24", reparsed);
+        check("D24", reparse == null, label + (reparse == null ? " OK" : " 실패 " + reparse));
     }
 
     private static boolean isType(final RecordSchema s, final String name, final RecordFieldType type) {
@@ -401,12 +479,17 @@ public class Verify3 {
     }
 
     private static boolean allNull(final Record r, final String[] names) {
-        for (String n : names) {
-            if (r.getValue(n) != null) {
-                return false;
+        return nonNullCount(r, names) == 0;
+    }
+
+    private static int nonNullCount(final Record r, final String[] names) {
+        int n = 0;
+        for (String name : names) {
+            if (r.getValue(name) != null) {
+                n++;
             }
         }
-        return true;
+        return n;
     }
 
     /** NiFi 바이트 값(Object[] of Byte, byte[], ByteBuffer) → byte[] */
@@ -431,22 +514,66 @@ public class Verify3 {
         return null;
     }
 
-    private static void check(final String id, final boolean ok) {
-        RESULTS.merge(id, ok, Boolean::logicalAnd);
+    // ===================================================================== 출력 형식
+
+    /** NiFi 타입 표시 (예: STRING, DECIMAL[10,3], ARRAY[BYTE]) */
+    private static String typeOf(final RecordSchema s, final String name) {
+        return s.getDataType(name).map(DataType::toString).orElse("필드없음");
     }
 
-    /** 케이스 전체 실패: 케이스 ID를 FAIL로 기록하고 근본 원인을 짧게 저장 */
+    /** "NiFi타입 값" */
+    private static String tv(final RecordSchema s, final Record r, final String name) {
+        return typeOf(s, name) + " " + v(r.getValue(name));
+    }
+
+    /** 값 표시: 문자열은 따옴표, decimal은 지수 표기 없이, 바이트는 [1, 2, 3] */
+    private static String v(final Object o) {
+        if (o == null) {
+            return "null";
+        }
+        if (o instanceof BigDecimal) {
+            return ((BigDecimal) o).toPlainString();
+        }
+        if (o instanceof CharSequence) {
+            return "\"" + o + "\"";
+        }
+        final byte[] b = bytesOf(o);
+        if (b != null) {
+            return Arrays.toString(b);
+        }
+        return o + "(" + o.getClass().getSimpleName() + ")";
+    }
+
+    /** avro.schema 필드 타입 표시 (예: bytes:decimal(10,3), long) */
+    private static String at(final Schema avro, final String name) {
+        final Schema.Field fld = avro.getField(name);
+        if (fld == null) {
+            return "필드없음";
+        }
+        final Schema t = nonNull(fld.schema());
+        if (t.getLogicalType() instanceof LogicalTypes.Decimal) {
+            final LogicalTypes.Decimal d = (LogicalTypes.Decimal) t.getLogicalType();
+            return t.getType().getName() + ":decimal(" + d.getPrecision() + "," + d.getScale() + ")";
+        }
+        return t.getType().getName();
+    }
+
+    private static void check(final String id, final boolean ok, final String actual) {
+        RESULTS.merge(id, ok, Boolean::logicalAnd);
+        ACTUAL.merge(id, actual, (a, b) -> a + ", " + b);
+    }
+
+    /** 케이스 전체 실패: 케이스 ID로 근본 원인을 짧게 기록 (하위 항목은 SKIP으로 표시됨) */
     private static void error(final String caseId, final Throwable t) {
         Throwable c = t;
         while (c.getCause() != null && c.getCause() != c) {
             c = c.getCause();
         }
         String msg = String.valueOf(c.getMessage());
-        if (msg.length() > 50) {
-            msg = msg.substring(0, 50) + "...";
+        if (msg.length() > 60) {
+            msg = msg.substring(0, 60) + "...";
         }
-        check(caseId, false);
-        ERRORS.add(caseId + " " + c.getClass().getSimpleName() + ": " + msg);
+        check(caseId, false, c.getClass().getSimpleName() + ": " + msg);
     }
 
     // ===================================================================== 읽기
