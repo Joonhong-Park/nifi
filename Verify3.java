@@ -13,14 +13,15 @@ import org.apache.nifi.serialization.record.RecordFieldType;
 import org.apache.nifi.serialization.record.RecordSchema;
 import org.apache.nifi.serialization.record.type.DecimalDataType;
 import org.apache.parquet.example.data.Group;
+import org.apache.parquet.example.data.GroupWriter;
 import org.apache.parquet.example.data.simple.SimpleGroupFactory;
 import org.apache.parquet.hadoop.ParquetWriter;
 import org.apache.parquet.hadoop.api.WriteSupport;
-import org.apache.parquet.hadoop.example.GroupWriteSupport;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.io.OutputFile;
 import org.apache.parquet.io.PositionOutputStream;
 import org.apache.parquet.io.api.Binary;
+import org.apache.parquet.io.api.RecordConsumer;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.Types;
 import org.slf4j.LoggerFactory;
@@ -557,7 +558,34 @@ public class Verify3 {
 
         @Override
         protected WriteSupport<Group> getWriteSupport(final Configuration conf) {
-            return new GroupWriteSupport(type, meta);
+            return new MetaGroupWriteSupport(type, meta);
+        }
+    }
+
+    /** GroupWriteSupport 대체 (해당 생성자가 package-private): 스키마 + footer 메타데이터 지정 */
+    private static final class MetaGroupWriteSupport extends WriteSupport<Group> {
+        private final MessageType type;
+        private final Map<String, String> meta;
+        private GroupWriter groupWriter;
+
+        MetaGroupWriteSupport(final MessageType type, final Map<String, String> meta) {
+            this.type = type;
+            this.meta = meta;
+        }
+
+        @Override
+        public WriteContext init(final Configuration configuration) {
+            return new WriteContext(type, meta);
+        }
+
+        @Override
+        public void prepareForWrite(final RecordConsumer recordConsumer) {
+            this.groupWriter = new GroupWriter(recordConsumer, type);
+        }
+
+        @Override
+        public void write(final Group record) {
+            groupWriter.write(record);
         }
     }
 
