@@ -21,31 +21,33 @@ import java.util.Map;
 
 /**
  * 사용자 스키마의 필드 순서대로 Parquet 컬럼을 매핑하는 ReadSupport (parquet 1.13.1 기준).
- * - 이름: 사용자 스키마 i번째 필드명 (파일 컬럼명은 alias로 부여)
- * - 타입: 1순위 파일 내장 Avro 스키마의 필드 타입, 2순위 AvroSchemaConverter 변환 결과
- * - INT32/INT64 decimal 컬럼은 precision/scale을 기록 → RecordReader가 DECIMAL로 변환
- * - 사용자 필드가 더 많으면 초과 필드는 NULL, 더 적으면 초과 파일 컬럼은 읽지 않음
+ * <ul>
+ *   <li>이름: 사용자 스키마 i번째 필드명 ← 파일 i번째 컬럼 (원본 컬럼명은 alias로 부여, read schema 내부 전용)</li>
+ *   <li>타입: 1순위 파일 내장 Avro 스키마, 2순위 AvroSchemaConverter 변환 결과 (임시 이름으로 변환 후 위치로 조회)</li>
+ *   <li>사용자 필드가 더 많으면 초과 필드는 NULL, 더 적으면 초과 파일 컬럼은 읽지 않음</li>
+ *   <li>INT32/INT64 decimal 컬럼은 precision/scale을 기록 → RecordReader가 DECIMAL로 변환</li>
+ * </ul>
  */
 public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
 
-    /** Reader가 사용자 스키마 JSON을 전달할 때 쓰는 설정 키 */
+    /** Controller Service가 사용자 스키마 JSON을 전달할 때 쓰는 설정 키 */
     public static final String USER_SCHEMA_KEY = "positional.parquet.user.schema";
 
-    /** parquet-avro 내부의 read schema 설정 키 (AvroReadSupport.AVRO_READ_SCHEMA와 동일) */
-    private static final String AVRO_READ_SCHEMA_KEY = "parquet.avro.read.schema";
-
-    /** 파일 footer에 내장된 Avro 스키마 키 (신규 / 구버전, AvroReadSupport와 동일한 우선순위) */
+    /** 파일 footer에 내장된 Avro 스키마 키 (AvroReadSupport와 같은 우선순위: 신규 → 구버전) */
     private static final String EMBEDDED_SCHEMA_KEY = "parquet.avro.schema";
     private static final String OLD_EMBEDDED_SCHEMA_KEY = "avro.schema";
+
+    /**
+     * 변환기에 넘길 임시 컬럼명 접두어.
+     * 변환기는 FIXED/INT96/group 컬럼의 Avro 타입 이름에 컬럼명을 쓰는데, 'bytes', 'int' 같은
+     * Avro 기본 타입 이름은 타입 이름으로 쓸 수 없으므로 위치 기반 임시 이름을 사용한다.
+     */
+    private static final String TEMP_COLUMN_PREFIX = "pq_col_";
 
     /** INT32/INT64 decimal 컬럼: 사용자 필드명 → decimal 정보 (init 시 수집) */
     private final Map<String, LogicalTypeAnnotation.DecimalLogicalTypeAnnotation> integerDecimalFields = new HashMap<>();
 
-    public PositionalAvroReadSupport() {
-        super();
-    }
-
-    /** RecordReader가 첫 레코드를 읽은 뒤 decimal 컬럼 정보를 가져갈 때 사용 */
+    /** RecordReader가 첫 레코드를 읽은 뒤(= init 이후) decimal 컬럼 정보를 가져갈 때 사용 */
     public Map<String, LogicalTypeAnnotation.DecimalLogicalTypeAnnotation> getIntegerDecimalFields() {
         return Collections.unmodifiableMap(integerDecimalFields);
     }
@@ -54,89 +56,55 @@ public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
     public ReadSupport.ReadContext init(final Configuration conf,
                                         final Map<String, String> keyValueMetaData,
                                         final MessageType fileSchema) {
-
         integerDecimalFields.clear();
 
-        final String userSchemaText = conf.get(USER_SCHEMA_KEY);
-        if (userSchemaText == null || userSchemaText.trim().isEmpty()) {
-            throw new IllegalArgumentException("사용자 스키마가 설정되지 않았습니다: " + USER_SCHEMA_KEY);
-        }
-
-        final Schema userSchema = new Schema.Parser().parse(userSchemaText);
-        if (userSchema.getType() != Schema.Type.RECORD) {
-            throw new IllegalArgumentException("사용자 스키마는 record 타입이어야 합니다: " + userSchema.getType());
-        }
-
+        final Schema userSchema = parseUserSchema(conf.get(USER_SCHEMA_KEY));
         final List<Schema.Field> userFields = userSchema.getFields();
         final List<Type> fileColumns = fileSchema.getFields();
-        final int n = userFields.size();
-        final int k = Math.min(n, fileColumns.size());
+        final int userFieldCount = userFields.size();
+        final int mappedCount = Math.min(userFieldCount, fileColumns.size());
 
-        // 0) 파일 내장 Avro 스키마
+        // 1) projection: 파일의 앞 mappedCount개 컬럼만 읽음 (원본 이름 유지, 초과 컬럼은 절삭)
+        final MessageType projection = new MessageType(fileSchema.getName(),
+                new ArrayList<>(fileColumns.subList(0, mappedCount)));
+
+        // 2) 타입 결정용 스키마: 내장 Avro 스키마(1순위), 임시 이름 사본의 변환 결과(2순위, 위치로 조회)
         final Schema embeddedSchema = parseEmbeddedSchema(keyValueMetaData);
-
-        // 1) projection: 파일의 앞 k개 컬럼만 읽음 (원본 이름 유지)
-        final MessageType projection = new MessageType(fileSchema.getName(), new ArrayList<>(fileColumns.subList(0, k)));
-
-        // 2) 이름만 사용자 이름으로 바꾼 사본을 변환기로 Avro 타입 변환 (2순위용)
-        Schema fileTyped = null;
-        if (k > 0) {
-            final List<Type> renamed = new ArrayList<>(k);
-            for (int i = 0; i < k; i++) {
-                renamed.add(rename(fileColumns.get(i), userFields.get(i).name()));
-            }
-            fileTyped = new AvroSchemaConverter(conf).convert(new MessageType(fileSchema.getName(), renamed));
-        }
+        final Schema convertedSchema = convertForTypes(conf, fileSchema.getName(), fileColumns, mappedCount);
 
         // 3) read schema 조립
-        final List<Schema.Field> readFields = new ArrayList<>(n);
-        for (int i = 0; i < n; i++) {
+        final List<Schema.Field> readFields = new ArrayList<>(userFieldCount);
+        for (int i = 0; i < userFieldCount; i++) {
             final String name = userFields.get(i).name();
-            if (i < k) {
+            if (i < mappedCount) {
                 final Type column = fileColumns.get(i);
-                final String originalName = column.getName();
-
-                // 1순위: 내장 스키마의 타입, 2순위: 변환기 결과
-                Schema typeFromFile = null;
-                if (embeddedSchema != null) {
-                    final Schema.Field embeddedField = embeddedSchema.getField(originalName);
-                    if (embeddedField != null) {
-                        typeFromFile = embeddedField.schema();
-                    }
-                }
-                if (typeFromFile == null) {
-                    typeFromFile = fileTyped.getField(name).schema();
-                }
-
-                final Schema.Field field = new Schema.Field(name, typeFromFile, null, (Object) null);
-                if (!name.equals(originalName)) {
-                    field.addAlias(originalName);
-                }
-                readFields.add(field);
-
-                // INT32/INT64 decimal 컬럼 기록 (Avro 스키마에는 scale이 없으므로 Parquet 스키마에서 가져옴)
-                if (column.isPrimitive()
-                        && column.getLogicalTypeAnnotation() instanceof LogicalTypeAnnotation.DecimalLogicalTypeAnnotation) {
-                    final PrimitiveType.PrimitiveTypeName pt = column.asPrimitiveType().getPrimitiveTypeName();
-                    if (pt == PrimitiveType.PrimitiveTypeName.INT32 || pt == PrimitiveType.PrimitiveTypeName.INT64) {
-                        integerDecimalFields.put(name,
-                                (LogicalTypeAnnotation.DecimalLogicalTypeAnnotation) column.getLogicalTypeAnnotation());
-                    }
-                }
+                readFields.add(buildMappedField(name, i, column, embeddedSchema, convertedSchema));
+                recordIntegerDecimal(name, column);
             } else {
                 // 파일에 없는 필드: 사용자 타입을 nullable로 바꾸고 기본값 null
                 readFields.add(new Schema.Field(name, nullable(userFields.get(i).schema()), null,
                         Schema.Field.NULL_DEFAULT_VALUE));
             }
         }
-
         final Schema readSchema = Schema.createRecord(
                 userSchema.getName(), null, userSchema.getNamespace(), false, readFields);
 
-        // 4) read schema 지정 후 기본 init 수행 → projection으로 ReadContext 재구성
-        conf.set(AVRO_READ_SCHEMA_KEY, readSchema.toString());
+        // 4) read schema 지정 후 부모 init 수행 → projection으로 ReadContext 재구성
+        setAvroReadSchema(conf, readSchema);
         final ReadSupport.ReadContext base = super.init(conf, keyValueMetaData, projection);
         return new ReadSupport.ReadContext(projection, base.getReadSupportMetadata());
+    }
+
+    /** 사용자 스키마 파싱 (record 타입만 허용) */
+    private static Schema parseUserSchema(final String text) {
+        if (text == null || text.trim().isEmpty()) {
+            throw new IllegalArgumentException("사용자 스키마가 설정되지 않았습니다: " + USER_SCHEMA_KEY);
+        }
+        final Schema schema = new Schema.Parser().parse(text);
+        if (schema.getType() != Schema.Type.RECORD) {
+            throw new IllegalArgumentException("사용자 스키마는 record 타입이어야 합니다: " + schema.getType());
+        }
+        return schema;
     }
 
     /** 내장 Avro 스키마 파싱. 없거나 파싱할 수 없으면(예: '$' 컬럼명) null → 변환기 결과 사용 */
@@ -159,7 +127,60 @@ public class PositionalAvroReadSupport extends AvroReadSupport<GenericRecord> {
         }
     }
 
-    /** 이름만 바꾸고 repetition, 물리 타입, 길이, 논리 타입(decimal 등)은 유지 */
+    /**
+     * 앞 mappedCount개 컬럼의 이름을 임시 이름(pq_col_i)으로 바꾼 사본을 Avro로 변환.
+     * 원본 이름('$' 등)이나 사용자 이름('bytes', 'int' 등)으로 인한 Avro 이름 규칙 오류를 모두 피한다.
+     * 결과 필드는 위치(i)로 조회한다.
+     */
+    private static Schema convertForTypes(final Configuration conf, final String messageName,
+                                          final List<Type> fileColumns, final int mappedCount) {
+        if (mappedCount == 0) {
+            return null;
+        }
+        final List<Type> renamed = new ArrayList<>(mappedCount);
+        for (int i = 0; i < mappedCount; i++) {
+            renamed.add(rename(fileColumns.get(i), TEMP_COLUMN_PREFIX + i));
+        }
+        return new AvroSchemaConverter(conf).convert(new MessageType(messageName, renamed));
+    }
+
+    /** 파일에 있는 컬럼의 read schema 필드 생성: 이름=사용자 이름, 타입=내장 스키마 우선(없으면 변환 결과의 i번째), alias=원본 컬럼명 */
+    private static Schema.Field buildMappedField(final String name, final int index, final Type column,
+                                                 final Schema embeddedSchema, final Schema convertedSchema) {
+        final String originalName = column.getName();
+
+        Schema type = null;
+        if (embeddedSchema != null) {
+            final Schema.Field embeddedField = embeddedSchema.getField(originalName);
+            if (embeddedField != null) {
+                type = embeddedField.schema();
+            }
+        }
+        if (type == null) {
+            type = convertedSchema.getFields().get(index).schema();   // 임시 이름이므로 위치로 조회
+        }
+
+        final Schema.Field field = new Schema.Field(name, type, null, (Object) null);
+        if (!name.equals(originalName)) {
+            field.addAlias(originalName);   // parquet 컬럼 연결용 (NiFi 노출 스키마에는 포함되지 않음)
+        }
+        return field;
+    }
+
+    /** INT32/INT64 + DECIMAL 컬럼이면 decimal 정보 기록 (Avro 스키마에는 scale이 없으므로 Parquet 스키마에서 가져옴) */
+    private void recordIntegerDecimal(final String name, final Type column) {
+        if (!column.isPrimitive()
+                || !(column.getLogicalTypeAnnotation() instanceof LogicalTypeAnnotation.DecimalLogicalTypeAnnotation)) {
+            return;
+        }
+        final PrimitiveType.PrimitiveTypeName pt = column.asPrimitiveType().getPrimitiveTypeName();
+        if (pt == PrimitiveType.PrimitiveTypeName.INT32 || pt == PrimitiveType.PrimitiveTypeName.INT64) {
+            integerDecimalFields.put(name,
+                    (LogicalTypeAnnotation.DecimalLogicalTypeAnnotation) column.getLogicalTypeAnnotation());
+        }
+    }
+
+    /** 이름만 바꾸고 repetition, 물리 타입, 길이, 논리 타입(decimal 등), id는 유지 */
     private static Type rename(final Type type, final String newName) {
         final LogicalTypeAnnotation annotation = type.getLogicalTypeAnnotation();
 

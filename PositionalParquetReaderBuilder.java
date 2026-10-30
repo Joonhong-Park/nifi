@@ -7,7 +7,8 @@ import org.apache.parquet.io.InputFile;
 
 /**
  * AvroParquetReader.Builder 대신 사용하는 Builder.
- * ReadSupport를 PositionalAvroReadSupport로 교체하고, 그 인스턴스를 보관한다.
+ * AvroParquetReader.Builder는 ReadSupport를 바꿀 수 없으므로, ParquetReader.Builder를 상속해
+ * PositionalAvroReadSupport를 사용하고 그 인스턴스를 보관한다 (decimal 컬럼 정보 조회용).
  */
 public class PositionalParquetReaderBuilder extends ParquetReader.Builder<GenericRecord> {
 
@@ -22,7 +23,7 @@ public class PositionalParquetReaderBuilder extends ParquetReader.Builder<Generi
         return readSupport;
     }
 
-    /** 첫 레코드를 읽은 뒤 decimal 컬럼 정보를 꺼내기 위해 사용 */
+    /** 첫 레코드를 읽은 뒤(= ReadSupport.init 이후) decimal 컬럼 정보를 꺼내기 위해 사용 */
     public PositionalAvroReadSupport getPositionalReadSupport() {
         return readSupport;
     }

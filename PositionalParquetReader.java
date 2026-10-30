@@ -18,11 +18,15 @@ import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * 사용자 스키마의 필드 순서대로 Parquet을 읽는 Record Reader (Controller Service).
+ * 기본 ParquetReader(NiFi 1.23.2)와 같은 공통 설정을 적용한 뒤 사용자 스키마를 ReadSupport에 전달한다.
+ */
 @Tags({"parquet", "parse", "record", "row", "reader", "schema", "positional"})
 @CapabilityDescription("Parquet 파일을 사용자 지정 Avro 스키마의 필드 순서대로 읽는다. "
         + "파일 컬럼명(대문자, 특수문자 등)과 관계없이 i번째 컬럼을 스키마의 i번째 필드명으로 읽는다. "
         + "스키마 필드가 더 많으면 초과 필드는 NULL, 더 적으면 초과 컬럼은 읽지 않는다. "
-        + "타입은 파일 기준으로 읽으며, 사용자 타입은 Writer에서 적용한다.")
+        + "타입은 파일 기준으로 읽으며(INT32/INT64 decimal은 precision/scale 반영), 사용자 타입은 Writer에서 적용한다.")
 public class PositionalParquetReader extends AbstractControllerService implements RecordReaderFactory {
 
     static final PropertyDescriptor SCHEMA_TEXT = new PropertyDescriptor.Builder()
@@ -57,7 +61,7 @@ public class PositionalParquetReader extends AbstractControllerService implement
         final ParquetConfig parquetConfig = ParquetUtils.createParquetConfig(getConfigurationContext(), variables);
         ParquetUtils.applyCommonConfig(conf, parquetConfig);
 
-        // 사용자 스키마 전달 → PositionalAvroReadSupport에서 사용
+        // 사용자 스키마 전달 → PositionalAvroReadSupport.init()에서 사용
         conf.set(PositionalAvroReadSupport.USER_SCHEMA_KEY, schemaText);
 
         return new PositionalParquetRecordReader(in, inputLength, conf);

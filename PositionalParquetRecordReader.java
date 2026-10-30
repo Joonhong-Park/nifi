@@ -6,6 +6,7 @@ import org.apache.nifi.avro.AvroTypeUtil;
 import org.apache.nifi.parquet.stream.NifiParquetInputFile;
 import org.apache.nifi.serialization.RecordReader;
 import org.apache.nifi.serialization.SimpleRecordSchema;
+import org.apache.nifi.serialization.record.DataType;
 import org.apache.nifi.serialization.record.MapRecord;
 import org.apache.nifi.serialization.record.Record;
 import org.apache.nifi.serialization.record.RecordField;
@@ -20,21 +21,27 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * NiFi 1.23.2 ParquetRecordReader 기반.
- * - Parquet 읽기에 PositionalParquetReaderBuilder(→ PositionalAvroReadSupport)를 사용
- * - INT32/INT64 decimal 필드는 DECIMAL(precision, scale) 타입과 BigDecimal 값으로 변환
+ * NiFi 1.23.2 ParquetRecordReader 기반 RecordReader.
+ * <ul>
+ *   <li>Parquet 읽기에 PositionalParquetReaderBuilder(→ PositionalAvroReadSupport) 사용</li>
+ *   <li>INT32/INT64 decimal 필드는 DECIMAL(precision, scale) 타입과 BigDecimal 값으로 변환
+ *       (NiFi 기본 변환은 Avro long을 LONG으로 바꿔 scale 손실)</li>
+ *   <li>NiFi에 노출하는 스키마는 항상 새로 생성(원문 없음, alias 없음)
+ *       → ExtractRecordSchema의 avro.schema가 파일과 관계없이 같은 형태, 필드명은 사용자 컬럼명만</li>
+ * </ul>
  */
 public class PositionalParquetRecordReader implements RecordReader {
 
     private GenericRecord lastParquetRecord;
-    /** NiFi에 노출하는 스키마 (decimal 필드는 DECIMAL 타입) */
+    /** NiFi에 노출하는 스키마 (원문 없음, alias 없음, decimal 필드는 DECIMAL 타입) */
     private final RecordSchema recordSchema;
-    /** Avro 스키마 그대로의 NiFi 스키마 (decimal 외 필드 값 변환용) */
+    /** Avro 스키마 그대로의 NiFi 스키마 (값 변환용) */
     private final RecordSchema avroRecordSchema;
     /** INT32/INT64 decimal 필드명 → scale */
     private final Map<String, Integer> decimalScales = new HashMap<>();
@@ -61,14 +68,14 @@ public class PositionalParquetRecordReader implements RecordReader {
             throw new EOFException("레코드가 없어 스키마를 가져올 수 없습니다 (0건 Parquet 파일)");
         }
 
-        // Avro 스키마(사용자 이름 + 파일 타입) → NiFi RecordSchema
+        // Avro 스키마(사용자 이름 + 파일 타입) → NiFi RecordSchema (값 변환용, 원문·alias 포함)
         avroRecordSchema = AvroTypeUtil.createSchema(lastParquetRecord.getSchema());
 
-        // INT32/INT64 decimal 필드는 DECIMAL(precision, scale)로 교체
+        // 노출 스키마: INT32/INT64 decimal은 DECIMAL로 교체, 원문·alias 없이 새로 생성
         final Map<String, LogicalTypeAnnotation.DecimalLogicalTypeAnnotation> decimals =
                 builder.getPositionalReadSupport().getIntegerDecimalFields();
         decimals.forEach((name, d) -> decimalScales.put(name, d.getScale()));
-        recordSchema = applyDecimalTypes(avroRecordSchema, decimals);
+        recordSchema = buildOutputSchema(avroRecordSchema, decimals);
     }
 
     @Override
@@ -79,7 +86,7 @@ public class PositionalParquetRecordReader implements RecordReader {
 
         Map<String, Object> values = AvroTypeUtil.convertAvroRecordToMap(lastParquetRecord, avroRecordSchema);
 
-        // decimal 필드는 NiFi 변환 결과 대신 원본 값에서 BigDecimal 생성
+        // decimal 필드는 NiFi 변환 결과(Long) 대신 원본 값에서 BigDecimal 생성
         if (!decimalScales.isEmpty()) {
             values = new HashMap<>(values);
             for (Map.Entry<String, Integer> e : decimalScales.entrySet()) {
@@ -123,22 +130,21 @@ public class PositionalParquetRecordReader implements RecordReader {
                 + ", 타입=" + raw.getClass().getName());
     }
 
-    /** decimal 필드의 NiFi 타입을 DECIMAL(precision, scale)로 교체한 스키마 생성 */
-    private static RecordSchema applyDecimalTypes(final RecordSchema schema,
+    /**
+     * NiFi에 노출할 스키마 생성.
+     * - 항상 새 SimpleRecordSchema 생성 (Avro 원문 없음 → avro.schema는 NiFi가 필드 타입으로 생성)
+     * - 모든 필드의 alias 제거 (alias는 parquet 컬럼 연결용 read schema 내부에서만 필요)
+     * - INT32/INT64 decimal 필드는 DECIMAL(precision, scale)로 교체
+     */
+    private static RecordSchema buildOutputSchema(final RecordSchema schema,
             final Map<String, LogicalTypeAnnotation.DecimalLogicalTypeAnnotation> decimals) {
-        if (decimals.isEmpty()) {
-            return schema;
-        }
-        final List<RecordField> fields = new ArrayList<>();
+        final List<RecordField> fields = new ArrayList<>(schema.getFieldCount());
         for (RecordField f : schema.getFields()) {
             final LogicalTypeAnnotation.DecimalLogicalTypeAnnotation d = decimals.get(f.getFieldName());
-            if (d == null) {
-                fields.add(f);
-            } else {
-                fields.add(new RecordField(f.getFieldName(),
-                        RecordFieldType.DECIMAL.getDecimalDataType(d.getPrecision(), d.getScale()),
-                        f.getDefaultValue(), f.getAliases(), f.isNullable()));
-            }
+            final DataType type = (d == null)
+                    ? f.getDataType()
+                    : RecordFieldType.DECIMAL.getDecimalDataType(d.getPrecision(), d.getScale());
+            fields.add(new RecordField(f.getFieldName(), type, f.getDefaultValue(), Collections.emptySet(), f.isNullable()));
         }
         return new SimpleRecordSchema(fields);
     }
